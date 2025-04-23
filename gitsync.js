@@ -746,80 +746,62 @@ module.exports = class GitSync {
     });
   }
 
-  async updateIssue(config, client, workItem) {
-    log.info(`Updating issue for work item (${workItem.id})...`);
-    const octokit = new github.getOctokit(config.github.token);
-    const [owner, repo] = config.GITHUB_REPOSITORY.split("/");
+  async updateIssues(config) {
+    log.info("Updating issues...");
+    log.debug("AzDO Url:", config.ado.orgUrl);
 
-    // fetch ADO fields (including tags)
-    const wiObj = await client.getWorkItem(workItem.id, [
-      "System.Title",
-      "System.Description",
-      "System.State",
-      "System.ChangedDate",
-      "System.Tags",
-    ]);
+    let conn = this.getConnection(config);
+    let client = null;
+    let result = null;
+    let workItems = null;
 
-    // extract GitHub issue number from the ADO tags
-    const tags = wiObj.fields["System.Tags"] || "";
-    const tagMatch = tags.match(/GitHub Issue #(?<number>\d+);/);
-    if (!tagMatch) {
-      log.info(`Work item ${workItem.id} has no GitHub Issue tag, skipping.`);
-      return null;
+    try {
+      client = await conn.getWorkItemTrackingApi();
+    } catch (exc) {
+      log.error("Error: cannot connect to organization.");
+      log.error(exc);
+      core.setFailed(exc);
+      return -1;
     }
-    const issue_number = tagMatch.groups.number;
 
-    // fetch the existing GitHub issue
-    const issue = (
-      await octokit.rest.issues.get({
-        owner,
-        repo,
-        issue_number,
-      })
-    ).data;
+    let context = { project: config.ado.project };
+    let wiql = {
+      query:
+        "SELECT [System.Id], [System.Description], [System.Title], [System.AssignedTo], [System.State], [System.Tags] FROM workitems WHERE [System.TeamProject] = @project " +
+        "AND [System.WorkItemType] = '" +
+        config.ado.wit +
+        "'" +
+        "AND [System.Tags] CONTAINS 'GitHub Issue' " +
+        "AND [System.Tags] CONTAINS 'GitHub Repo: " +
+        config.GITHUB_REPOSITORY +
+        "' " +
+        "AND [System.ChangedDate] > @Today - 1",
+    };
 
-    // if ADO changed more recently than GH, sync it
-    if (
-      new Date(wiObj.fields["System.ChangedDate"]) > new Date(issue.updated_at)
-    ) {
-      const converter = new showdown.Converter();
-      let title = wiObj.fields["System.Title"];
-      let body = converter
-        .makeMarkdown(wiObj.fields["System.Description"] || "")
-        .replace(/<br>/g, "")
-        .trim();
-      let states = config.ado.states;
-      let state = Object.keys(states).find(
-        (k) => states[k] === wiObj.fields["System.State"]
-      );
+    log.debug("WIQL Query:", wiql);
 
-      // only call the API if something really changed
-      if (
-        title !== issue.title ||
-        body !== issue.body ||
-        state !== issue.state
-      ) {
-        log.info(
-          `Pushing updates of ADO #${workItem.id} → GH issue #${issue_number}`
-        );
-        return octokit.rest.issues.update({
-          owner,
-          repo,
-          issue_number,
-          title,
-          body,
-          state,
-        });
-      } else {
-        log.info(`No changes for GH issue #${issue_number}`);
+    try {
+      result = await client.queryByWiql(wiql, context);
+      log.debug("Query results:", result);
+
+      if (result === null) {
+        log.error("Error: project name appears to be invalid.");
+        core.setFailed("Error: project name appears to be invalid.");
+        return -1;
       }
-    } else {
-      log.info(
-        `ADO #${workItem.id} is not newer than GH issue #${issue_number}, skipping.`
-      );
+    } catch (exc) {
+      log.error("Error: unknown error while searching for work item.");
+      log.error(exc);
+      core.setFailed(exc);
+      return -1;
     }
-    return null;
+
+    workItems = result.workItems;
+    workItems.forEach(async (workItem) => {
+      await this.updateIssue(config, client, workItem);
+    });
   }
+
   async createIssuesFromWorkItems(config) {
     log.info("Creating GitHub issues for un-tagged ADO work items…");
 
@@ -879,133 +861,71 @@ module.exports = class GitSync {
     }
   }
 
-  updateIssue(config, client, workItem) {
+  async updateIssue(config, client, workItem) {
     log.info(`Updating issue for work item (${workItem.id})...`);
     const octokit = new github.getOctokit(config.github.token);
     const owner = config.GITHUB_REPOSITORY_OWNER;
     const repo = config.GITHUB_REPOSITORY.replace(owner + "/", "");
     const converter = new showdown.Converter();
 
-    log.debug(`[WORKITEM: ${workItem.id}] Owner:`, owner);
-    log.debug(`[WORKITEM: ${workItem.id}] Repo:`, repo);
+    // fetch the full ADO item
+    const wiObj = await client.getWorkItem(workItem.id, [
+      "System.Title",
+      "System.Description",
+      "System.State",
+      "System.ChangedDate",
+    ]);
 
-    return client
-      .getWorkItem(workItem.id, [
-        "System.Title",
-        "System.Description",
-        "System.State",
-        "System.ChangedDate",
-      ])
-      .then(async (wiObj) => {
-        let parsed = wiObj.fields["System.Title"].match(
-          /^GH\s#(?<number>\d+):\s(?<title>.*)/
-        );
+    // guard – only titles like "GH #123: ..." get synced
+    const titleField = wiObj.fields["System.Title"] || "";
+    const m = titleField.match(/^GH\s#(?<number>\d+):\s(?<title>.*)/);
+    if (!m) {
+      log.info(
+        `Skipping work item ${workItem.id} – title not in "GH #<number>: ..."`
+      );
+      return null;
+    }
+    const issue_number = m.groups.number;
+    const issue_title = m.groups.title;
 
-        let issue_number = parsed.groups.number;
-        log.debug(
-          `[WORKITEM: ${workItem.id} / ISSUE: ${issue_number}] Issue Number:`,
-          issue_number
-        );
+    // pull the corresponding GitHub Issue
+    const issueData = (
+      await octokit.rest.issues.get({
+        owner,
+        repo,
+        issue_number,
+      })
+    ).data;
 
-        // Get issue
-        const issue = (
-          await octokit.rest.issues.get({
-            owner,
-            repo,
-            issue_number,
-          })
-        ).data;
+    // if ADO is newer, push title/body/state back to GH
+    if (
+      new Date(wiObj.fields["System.ChangedDate"]) >
+      new Date(issueData.updated_at)
+    ) {
+      const body = converter
+        .makeMarkdown(wiObj.fields["System.Description"] || "")
+        .replace(/<br>/g, "")
+        .trim();
 
-        log.debug(
-          `[WORKITEM: ${workItem.id} / ISSUE: ${issue_number}] Issue:`,
-          issue
-        );
+      // map ADO state back to GH state
+      const states = config.ado.states;
+      const stateKey = Object.keys(states).find(
+        (k) => states[k] === wiObj.fields["System.State"]
+      );
 
-        // Check which is most recent
-        // If WorkItem is more recent than Issue, update Issue
-        // There is a case that WorkItem was updated by Issue, which is why it's more recent
-        // Currently checks to see if title, description/body, and state are the same. If so (which means the WorkItem matches the Issue), no updates are necessary
-        // Can later add check to see if last entry in history of WorkItem was indeed updated by GitHub
-        if (
-          new Date(wiObj.fields["System.ChangedDate"]) >
-          new Date(issue.updated_at)
-        ) {
-          log.debug(
-            `[WORKITEM: ${
-              workItem.id
-            } / ISSUE: ${issue_number}] WorkItem.ChangedDate (${new Date(
-              wiObj.fields["System.ChangedDate"]
-            )}) is more recent than Issue.UpdatedAt (${new Date(
-              issue.updated_at
-            )}). Updating issue...`
-          );
-          let title = parsed.groups.title;
-          let body = converter
-            .makeMarkdown(wiObj.fields["System.Description"])
-            .replace(/<br>/g, "")
-            .trim();
-
-          let states = config.ado.states;
-          let state = Object.keys(states).find(
-            (k) => states[k] === wiObj.fields["System.State"]
-          );
-
-          log.debug(
-            `[WORKITEM: ${workItem.id} / ISSUE: ${issue_number}] Title:`,
-            title
-          );
-          log.debug(
-            `[WORKITEM: ${workItem.id} / ISSUE: ${issue_number}] Body:`,
-            body
-          );
-          log.debug(
-            `[WORKITEM: ${workItem.id} / ISSUE: ${issue_number}] State:`,
-            state
-          );
-
-          if (
-            title !== issue.title ||
-            body !== issue.body ||
-            state !== issue.state
-          ) {
-            let result = await octokit.rest.issues.update({
-              owner,
-              repo,
-              issue_number,
-              title,
-              body,
-              state,
-            });
-
-            log.debug(
-              `[WORKITEM: ${workItem.id} / ISSUE: ${issue_number}] Update:`,
-              result
-            );
-            log.debug(
-              `[WORKITEM: ${workItem.id} / ISSUE: ${issue_number}] Issue updated.`
-            );
-
-            return result;
-          } else {
-            log.debug(
-              `[WORKITEM: ${workItem.id} / ISSUE: ${issue_number}] Nothing has changed, so skipping.`
-            );
-
-            return null;
-          }
-        } else {
-          log.debug(
-            `[WORKITEM: ${
-              workItem.id
-            } / ISSUE: ${issue_number}] WorkItem.ChangedDate (${new Date(
-              wiObj.fields["System.ChangedDate"]
-            )}) is less recent than Issue.UpdatedAt (${new Date(
-              issue.updated_at
-            )}). Skipping issue update...`
-          );
-
-          return null;
-        }
+      return octokit.rest.issues.update({
+        owner,
+        repo,
+        issue_number,
+        title: issue_title,
+        body,
+        state: stateKey,
       });
+    }
+
+    log.debug(
+      `Work item ${workItem.id} not newer than GH issue ${issue_number}, skipping.`
+    );
+    return null;
   }
 };
