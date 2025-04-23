@@ -189,9 +189,6 @@ module.exports = class GitSync {
         break;
     }
 
-    if (!!config.schedule) {
-      await this.updateIssues(config);
-    }
     if (config.schedule) {
       await this.createIssuesFromWorkItems(config);
       await this.updateIssues(config);
