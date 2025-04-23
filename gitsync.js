@@ -746,62 +746,80 @@ module.exports = class GitSync {
     });
   }
 
-  async updateIssues(config) {
-    log.info("Updating issues...");
-    log.debug("AzDO Url:", config.ado.orgUrl);
+  async updateIssue(config, client, workItem) {
+    log.info(`Updating issue for work item (${workItem.id})...`);
+    const octokit = new github.getOctokit(config.github.token);
+    const [owner, repo] = config.GITHUB_REPOSITORY.split("/");
 
-    let conn = this.getConnection(config);
-    let client = null;
-    let result = null;
-    let workItems = null;
+    // fetch ADO fields (including tags)
+    const wiObj = await client.getWorkItem(workItem.id, [
+      "System.Title",
+      "System.Description",
+      "System.State",
+      "System.ChangedDate",
+      "System.Tags",
+    ]);
 
-    try {
-      client = await conn.getWorkItemTrackingApi();
-    } catch (exc) {
-      log.error("Error: cannot connect to organization.");
-      log.error(exc);
-      core.setFailed(exc);
-      return -1;
+    // extract GitHub issue number from the ADO tags
+    const tags = wiObj.fields["System.Tags"] || "";
+    const tagMatch = tags.match(/GitHub Issue #(?<number>\d+);/);
+    if (!tagMatch) {
+      log.info(`Work item ${workItem.id} has no GitHub Issue tag, skipping.`);
+      return null;
     }
+    const issue_number = tagMatch.groups.number;
 
-    let context = { project: config.ado.project };
-    let wiql = {
-      query:
-        "SELECT [System.Id], [System.Description], [System.Title], [System.AssignedTo], [System.State], [System.Tags] FROM workitems WHERE [System.TeamProject] = @project " +
-        "AND [System.WorkItemType] = '" +
-        config.ado.wit +
-        "'" +
-        "AND [System.Tags] CONTAINS 'GitHub Issue' " +
-        "AND [System.Tags] CONTAINS 'GitHub Repo: " +
-        config.GITHUB_REPOSITORY +
-        "' " +
-        "AND [System.ChangedDate] > @Today - 1",
-    };
+    // fetch the existing GitHub issue
+    const issue = (
+      await octokit.rest.issues.get({
+        owner,
+        repo,
+        issue_number,
+      })
+    ).data;
 
-    log.debug("WIQL Query:", wiql);
+    // if ADO changed more recently than GH, sync it
+    if (
+      new Date(wiObj.fields["System.ChangedDate"]) > new Date(issue.updated_at)
+    ) {
+      const converter = new showdown.Converter();
+      let title = wiObj.fields["System.Title"];
+      let body = converter
+        .makeMarkdown(wiObj.fields["System.Description"] || "")
+        .replace(/<br>/g, "")
+        .trim();
+      let states = config.ado.states;
+      let state = Object.keys(states).find(
+        (k) => states[k] === wiObj.fields["System.State"]
+      );
 
-    try {
-      result = await client.queryByWiql(wiql, context);
-      log.debug("Query results:", result);
-
-      if (result === null) {
-        log.error("Error: project name appears to be invalid.");
-        core.setFailed("Error: project name appears to be invalid.");
-        return -1;
+      // only call the API if something really changed
+      if (
+        title !== issue.title ||
+        body !== issue.body ||
+        state !== issue.state
+      ) {
+        log.info(
+          `Pushing updates of ADO #${workItem.id} → GH issue #${issue_number}`
+        );
+        return octokit.rest.issues.update({
+          owner,
+          repo,
+          issue_number,
+          title,
+          body,
+          state,
+        });
+      } else {
+        log.info(`No changes for GH issue #${issue_number}`);
       }
-    } catch (exc) {
-      log.error("Error: unknown error while searching for work item.");
-      log.error(exc);
-      core.setFailed(exc);
-      return -1;
+    } else {
+      log.info(
+        `ADO #${workItem.id} is not newer than GH issue #${issue_number}, skipping.`
+      );
     }
-
-    workItems = result.workItems;
-    workItems.forEach(async (workItem) => {
-      await this.updateIssue(config, client, workItem);
-    });
+    return null;
   }
-
   async createIssuesFromWorkItems(config) {
     log.info("Creating GitHub issues for un-tagged ADO work items…");
 
