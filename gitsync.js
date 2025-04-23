@@ -156,6 +156,8 @@ module.exports = class GitSync {
 
   async performWork(config) {
     let workItem = null;
+
+    // GitHub → ADO
     switch (config.action) {
       case "opened":
         workItem = await this.createWorkItem(config);
@@ -187,12 +189,12 @@ module.exports = class GitSync {
       case "created":
         workItem = await this.addComment(config);
         break;
+      default:
     }
 
-    if (config.schedule) {
-      await this.createIssuesFromWorkItems(config);
-      await this.updateIssues(config);
-    }
+    // ADO → GitHub
+    await this.createIssuesFromWorkItems(config);
+    await this.updateIssues(config);
 
     return workItem;
   }
